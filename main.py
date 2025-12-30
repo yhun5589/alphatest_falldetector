@@ -1,163 +1,202 @@
 import cv2
-from ultralytics import YOLO
-import mediapipe as mp
-import math
+import threading
+import time
+import socket
+from flask import Flask, Response, render_template
+from flask_sock import Sock
+from flaredantic import FlareTunnel, FlareConfig
+from demo_detector import detect, check_person_fall
+from queue import Queue, Empty
+import webbrowser
+from discordbot import send_text, start_async_loop, start_bot, send_alert
 
-# ---------------- PARAMETERS -----------------
-MODEL_PATH = "yolo12n.pt"
-CLASSES_PATH = "classes.txt"
+# =====================================================
+# Flask setup
+# =====================================================
+app = Flask(__name__)
+sock = Sock(app)
 
+# =====================================================
+# Shared state
+# =====================================================
+frame_lock = threading.Lock()
+latest_frame = None
+
+clients_lock = threading.Lock()
+client_queues = set()  # each client gets its own queue
+
+# =====================================================
+# Fall detection state
+# =====================================================
+first_fall_time = None
+alert_sent = False
+was_fallen_last_frame = False
+
+# =====================================================
+# Performance tuning
+# =====================================================
 FRAME_SIZE = 320
-MIN_PERSON_AREA_RATIO = 0.05
-KEYPOINT_VIS_TH = 0.35
-BODY_VIS_FRACTION = 0.35
-FALL_RATIO_THRESHOLD = 1.35  # h/w
-FALL_ANGLE_THRESHOLD = 45    # degrees, optional tilt check
+CAP_FPS = 15
+PROCESS_EVERY_N_FRAMES = 2
 
-# ---------------- LOAD MODEL -----------------
-model = YOLO(MODEL_PATH)
-model.fuse()  # CPU speedup
-with open(CLASSES_PATH, "r") as f:
-    classnames = f.read().splitlines()
+# =====================================================
+# Camera / Detection Thread
+# =====================================================
+def camera_loop():
+    global latest_frame, first_fall_time, alert_sent, was_fallen_last_frame
 
-# ---------------- MEDIAPIPE -----------------
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(
-    static_image_mode=False,
-    model_complexity=1,
-    enable_segmentation=False,
-    min_detection_confidence=0.5
-)
-TOTAL_LANDMARKS = 33
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_SIZE)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_SIZE)
+    cap.set(cv2.CAP_PROP_FPS, CAP_FPS)
 
-# ---------------- HELPER FUNCTIONS -----------------
-def body_visibility_ok(keypoints, bbox):
-    if not keypoints:
-        return False
-    x1, y1, x2, y2 = bbox
-    inside = 0
-    for x, y, v in keypoints:
-        if v < KEYPOINT_VIS_TH:
+    frame_count = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.01)
             continue
-        if x1 <= x <= x2 and y1 <= y <= y2:
-            inside += 1
-    return (inside / TOTAL_LANDMARKS) >= BODY_VIS_FRACTION
 
-def fall_angle(keypoints):
-    """
-    Optional: compute tilt angle of body using shoulders and hips.
-    Returns angle in degrees between vertical and line connecting shoulders/hips.
-    """
-    if len(keypoints) < 33:
-        return 0
-    # shoulder midpoint
-    lx, ly, lv = keypoints[11]
-    rx, ry, rv = keypoints[12]
-    if lv < KEYPOINT_VIS_TH or rv < KEYPOINT_VIS_TH:
-        return 0
-    mid_shoulder = ((lx+rx)/2, (ly+ry)/2)
-    # hip midpoint
-    lx, ly, lv = keypoints[23]
-    rx, ry, rv = keypoints[24]
-    if lv < KEYPOINT_VIS_TH or rv < KEYPOINT_VIS_TH:
-        return 0
-    mid_hip = ((lx+rx)/2, (ly+ry)/2)
-    dx = mid_hip[0] - mid_shoulder[0]
-    dy = mid_hip[1] - mid_shoulder[1]
-    if dy == 0:
-        return 90
-    angle = abs(math.degrees(math.atan(dx/dy)))
-    return angle
+        frame_count += 1
+        frame = cv2.resize(frame, (FRAME_SIZE, FRAME_SIZE))
 
-# ---------------- FALL CHECK (AGGRESSIVE) -----------------
-def check_person_fall(info, frame, keypoints=None):
-    """
-    Aggressive fall detection: anyone prone triggers fall.
-    Ignores objects to reduce false negatives.
-    """
-    if "person" not in info:
-        return False
+        # Skip some frames for detection
+        if frame_count % PROCESS_EVERY_N_FRAMES != 0:
+            with frame_lock:
+                latest_frame = frame
+            continue
 
-    fallen_any = False
-    for p in info["person"]:
-        ratio = p["height"] / (p["width"] + 1e-6)
-        angle = 0
-        if keypoints:
-            angle = fall_angle(keypoints)
+        # ---------------- Detection ----------------
+        try:
+            actually_fallen, info, annotated, keypoints = detect(frame)
+        except Exception as e:
+            print("Detect error:", e)
+            continue
 
-        if ratio < FALL_RATIO_THRESHOLD or angle > FALL_ANGLE_THRESHOLD:
-            fallen_any = True
-            cv2.putText(frame, "FALL!", (p["x1"], p["y1"] - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        else:
-            cv2.putText(frame, "standing", (p["x1"], p["y1"] - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        # ---------------- Fall Event ----------------
+        if actually_fallen and not was_fallen_last_frame:
+            now = time.time()
+            if first_fall_time is None:
+                first_fall_time = now
+                alert_sent = False
+                print("🟡 First fall detected")
+            else:
+                elapsed = now - first_fall_time
+                if elapsed < 7:
+                    print("⚪ Fall too soon, ignored")
+                elif 2.5 <= elapsed <= 15 and not alert_sent:
+                    print("🔴 ALERT: second fall in window")
+                    send_alert(
+                        "⚠️ FALL DETECTED (confirmed twice)",
+                        frame
+                    )
+                    with clients_lock:
+                        for q in client_queues:
+                            q.put("FALLDETECTED")
+                    alert_sent = True
+                elif elapsed > 15:
+                    print("🔁 Window expired, new first fall")
+                    first_fall_time = now
+                    alert_sent = False
 
-    return fallen_any
+        was_fallen_last_frame = actually_fallen
 
-# ---------------- MAIN DETECT FUNCTION -----------------
-def detect(frame, conf_threshold=0.6):
-    info = {}
-    new_frame = frame.copy()
+        # ---------------- Share frame ----------------
+        with frame_lock:
+            latest_frame = annotated if annotated is not None else frame
 
-    # YOLO detection
-    results = model(frame, imgsz=FRAME_SIZE, verbose=False)
+        time.sleep(0.005)
 
-    # MediaPipe pose
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    pose_result = pose.process(rgb)
-    keypoints = []
-    if pose_result.pose_landmarks:
-        for lm in pose_result.pose_landmarks.landmark:
-            keypoints.append((
-                int(lm.x * frame.shape[1]),
-                int(lm.y * frame.shape[0]),
-                lm.visibility
-            ))
+# =====================================================
+# MJPEG Streaming
+# =====================================================
+@app.route("/video_feed")
+def video_feed():
+    def gen():
+        last_sent_time = 0
+        while True:
+            with frame_lock:
+                frame = latest_frame.copy() if latest_frame is not None else None
 
-    # Process YOLO results
-    for r in results:
-        for box in r.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            conf = float(box.conf[0])
-            cls = int(box.cls[0])
-            name = classnames[cls]
-
-            if conf < conf_threshold:
-                continue
-            if name not in ("person", "bed", "sofa", "chair"):
+            if frame is None:
+                time.sleep(0.01)
                 continue
 
-            w, h = x2 - x1, y2 - y1
+            # Limit FPS
+            now = time.time()
+            if now - last_sent_time < 1 / 15:
+                time.sleep(0.01)
+                continue
+            last_sent_time = now
 
-            if name == "person":
-                area_ratio = (w*h) / (frame.shape[0]*frame.shape[1])
-                if area_ratio < MIN_PERSON_AREA_RATIO:
-                    continue
-                if not body_visibility_ok(keypoints, (x1, y1, x2, y2)):
-                    cv2.putText(new_frame, "partial body", (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
-                    continue
+            ret, buffer = cv2.imencode(".jpg", frame)
+            if not ret:
+                continue
 
-            # Store info
-            info.setdefault(name, []).append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "width": w, "height": h})
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" +
+                buffer.tobytes() +
+                b"\r\n"
+            )
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
-            # Draw bbox
-            color = (0,255,0) if name != "person" else (255,255,0)
-            cv2.rectangle(new_frame, (x1,y1), (x2,y2), color, 2)
+# =====================================================
+# WebSocket for Alerts
+# =====================================================
+@sock.route('/ws')
+def ws(ws):
+    q = Queue()
+    with clients_lock:
+        client_queues.add(q)
 
-    # Aggressive fall check
-    actually_fallen = check_person_fall(info, new_frame, keypoints)
+    try:
+        while True:
+            try:
+                msg = q.get(timeout=1)  # blocking ensures reliable alert delivery
+                ws.send(msg)
+                time.sleep(0.01)  # prevent busy loop
+            except Empty:
+                continue
+    finally:
+        with clients_lock:
+            client_queues.remove(q)
 
-    return actually_fallen, info, new_frame, keypoints
+# =====================================================
+# Index
+# =====================================================
+@app.route("/")
+def index():
+    return render_template("index.html")
 
-# ---------------- TEST -----------------
+# =====================================================
+# Flare Tunnel
+# =====================================================
+def start_tunnel():
+    global public_url
+    config = FlareConfig(port=5000)
+    with FlareTunnel(config) as tunnel:
+        public_url = tunnel.tunnel_url
+        print("🌐 Public URL:", public_url)
+        send_text(public_url)
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+# If your server runs on a specific port, set it here
+        port = 5000  # change if needed
+        url = f"http://{local_ip}:{port}"
+        webbrowser.open(url)
+        while True:
+            time.sleep(1)
+
+# =====================================================
+# Main
+# =====================================================
 if __name__ == "__main__":
-    frame = cv2.imread("hq722.jpg")
-    fallen, info, annotated, keypoints = detect(frame)
-    print("Fall detected:", fallen)
-    print("Detection info:", info)
-    print("Keypoints:", keypoints)
-    cv2.imshow("Annotated", annotated)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    threading.Thread(target=start_async_loop, daemon=True).start()
+    threading.Thread(target=start_bot, daemon=True).start()
+    threading.Thread(target=camera_loop, daemon=True).start()
+    threading.Thread(target=start_tunnel, daemon=True).start()
+
+    print("🚀 Server running")
+    app.run(host="0.0.0.0", port=5000, threaded=True, debug=False)
