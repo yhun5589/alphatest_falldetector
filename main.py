@@ -1,6 +1,8 @@
+import asyncio
 import cv2
 import threading
 import time
+import discordbot
 import socket
 from flask import Flask, Response, render_template
 from flask_sock import Sock
@@ -8,7 +10,7 @@ from flaredantic import FlareTunnel, FlareConfig
 from demo_detector import detect, check_person_fall
 from queue import Queue, Empty
 import webbrowser
-from discordbot import send_text, start_async_loop, start_bot, send_alert
+from discordbot import send_text, run_bot, send_alert_from_detector
 
 # =====================================================
 # Flask setup
@@ -87,10 +89,7 @@ def camera_loop():
                     print("⚪ Fall too soon, ignored")
                 elif 2.5 <= elapsed <= 15 and not alert_sent:
                     print("🔴 ALERT: second fall in window")
-                    send_alert(
-                        "⚠️ FALL DETECTED (confirmed twice)",
-                        frame
-                    )
+                    send_alert_from_detector(frame, "⚠️ FALL DETECTED (confirmed twice)")
                     with clients_lock:
                         for q in client_queues:
                             q.put("FALLDETECTED")
@@ -176,25 +175,34 @@ def index():
 def start_tunnel():
     global public_url
     config = FlareConfig(port=5000)
+
     with FlareTunnel(config) as tunnel:
         public_url = tunnel.tunnel_url
         print("🌐 Public URL:", public_url)
-        send_text(public_url)
+
+        # wait until discord is ready
+        while discordbot.loop is None:
+            time.sleep(0.5)
+
+        asyncio.run_coroutine_threadsafe(
+            send_text(public_url),
+            discordbot.loop
+        )
+
         hostname = socket.gethostname()
         local_ip = socket.gethostbyname(hostname)
-# If your server runs on a specific port, set it here
-        port = 5000  # change if needed
-        url = f"http://{local_ip}:{port}"
+        url = f"http://{local_ip}:5000"
         webbrowser.open(url)
+
         while True:
             time.sleep(1)
+
 
 # =====================================================
 # Main
 # =====================================================
 if __name__ == "__main__":
-    threading.Thread(target=start_async_loop, daemon=True).start()
-    threading.Thread(target=start_bot, daemon=True).start()
+    threading.Thread(target=run_bot, daemon=True).start()
     threading.Thread(target=camera_loop, daemon=True).start()
     threading.Thread(target=start_tunnel, daemon=True).start()
 
