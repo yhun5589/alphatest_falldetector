@@ -2,10 +2,13 @@ import discord
 import asyncio
 import cv2
 from io import BytesIO
-import time
+import os
+
+CASCADE_PATH = os.path.join(os.path.dirname(__file__), "cv2/data/haarcascade_frontalface_default.xml")
+cascade = cv2.CascadeClassifier(CASCADE_PATH)
 
 # ================= CONFIG =================
-BOT_TOKEN = "MTQ1NTQxMzUyNTI3NDAzNDE4OA.G9_Fya.o6rGaTyROngr5XsTDmtA6UaGgs2d1WqYzEk4vU"
+BOT_TOKEN = "Yourtoken"
 
 with open("userids.txt", "r") as f:
     CHANNEL_IDS = [int(x.strip()) for x in f if x.strip()]
@@ -77,6 +80,21 @@ async def on_ready():
     global loop
     loop = asyncio.get_running_loop()
     print("✅ Discord bot ready")
+
+
+@client.event
+async def on_message(message):
+    # ignore bot's own messages
+    if message.author.bot:
+        return
+
+    if message.content.strip().upper() == "SERVERIDS":
+        if message.guild:
+            server_id = message.guild.id
+            print(f"📌 Server ID: {server_id}")
+            await message.channel.send(f"Server ID: `{server_id}`")
+        else:
+            await message.channel.send("❌ This command only works in a server.")
 
 # ================= START =================
 def run_bot():
